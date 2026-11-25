@@ -683,20 +683,37 @@ impl Layout {
         let linear = self.desc.swizzle == Swizzle::LINEAR;
         // The row and depth contribute one common base to every column, so
         // the same contiguous runs repeat on every row, including mip tails.
+        // A tightly packed linear plane can be copied at once. Do not
+        // include slice padding or the caller's depth pitch in the copy.
+        if linear && m.pitch as usize * n == bytes && row_pitch == bytes {
+            let len = bytes * m.height as usize;
+            for z in 0..depth {
+                let (s, _) = self.split(first + z);
+                let base = u64::from(s) * self.slice_size + m.offset;
+                copy(base as usize, z as usize * depth_pitch, len);
+            }
+            return Ok(());
+        }
         let mut runs = Vec::new();
         if !linear {
-            let mut first_linear = 0;
-            let mut first_tiled = self.column(m, 0) as usize;
-            for x in 1..m.width {
-                let offset = self.column(m, x) as usize;
-                let at = x as usize * n;
-                if offset != first_tiled + (at - first_linear) {
-                    runs.push((first_tiled, first_linear, at - first_linear));
-                    first_tiled = offset;
-                    first_linear = at;
-                }
+            // Column offsets are a permutation of coordinate bits. The
+            // consecutive low bits give the contiguous span within a
+            // block. Jump directly between spans instead of checking
+            // the address of every element. A tail can start mid-span.
+            let mut span = 1usize;
+            while span < self.pattern[0].len()
+                && self.pattern[0][span] as usize == span * n
+            {
+                span *= 2;
             }
-            runs.push((first_tiled, first_linear, bytes - first_linear));
+            let tail_x = m.tail.map_or(0, |t| t.x) as usize;
+            let width = m.width as usize;
+            let mut x = 0;
+            while x < width {
+                let count = (span - (x + tail_x) % span).min(width - x);
+                runs.push((self.column(m, x as u32) as usize, x * n, count * n));
+                x += count;
+            }
         }
         // A mip can end partway through the last run. Check the other runs
         // once so each row can copy them with a compile-time length.
@@ -716,6 +733,9 @@ impl Layout {
                 } else {
                     let tiled_row = (base + self.row(m, y, inner)) as usize;
                     match run_len {
+                        Some(1) => copy_runs::<1>(body, tiled_row, linear_row, &mut copy),
+                        Some(2) => copy_runs::<2>(body, tiled_row, linear_row, &mut copy),
+                        Some(4) => copy_runs::<4>(body, tiled_row, linear_row, &mut copy),
                         Some(8) => copy_runs::<8>(body, tiled_row, linear_row, &mut copy),
                         Some(16) => copy_runs::<16>(body, tiled_row, linear_row, &mut copy),
                         Some(32) => copy_runs::<32>(body, tiled_row, linear_row, &mut copy),
@@ -989,6 +1009,49 @@ mod tests {
                             }
                         }
                         assert!(back[base + plane - 11..base + plane].iter().all(|&b| b == 0xcc));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check the optimized walk against individual element addresses,
+    /// not just a round trip (which could hide a symmetric mistake).
+    #[test]
+    fn copy_runs_match_element_offsets() {
+        for swizzle in [
+            Swizzle::LINEAR,
+            Swizzle::SW_256B_S,
+            Swizzle::SW_256B_D,
+            Swizzle::SW_4KB_S,
+            Swizzle::SW_4KB_D,
+            Swizzle::SW_64KB_S,
+            Swizzle::SW_64KB_D,
+        ] {
+            for n in [1, 2, 4, 8, 16] {
+                for width in [1, 17, 64, 256, 259] {
+                    let d = desc(width, 37, 6, n, swizzle);
+                    let l = Layout::new(&d).unwrap();
+                    for mip in 0..d.mips {
+                        let m = l.mips[mip as usize];
+                        let row = m.width as usize * n as usize;
+                        let plane = row * m.height as usize;
+                        let mut visited = 0;
+                        l.walk(l.size as usize, mip, 0, plane, row, plane, |t, a, len| {
+                            assert_eq!(a, visited);
+                            for i in (0..len).step_by(n as usize) {
+                                let element = (a + i) / n as usize;
+                                let x = (element % m.width as usize) as u32;
+                                let y = (element / m.width as usize) as u32;
+                                assert_eq!(
+                                    l.offset(mip, x, y, 0).unwrap() as usize,
+                                    t + i
+                                );
+                            }
+                            visited += len;
+                        })
+                        .unwrap();
+                        assert_eq!(visited, plane);
                     }
                 }
             }
